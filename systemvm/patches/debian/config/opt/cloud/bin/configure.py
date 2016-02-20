@@ -42,6 +42,7 @@ from cs.CsMonitor import CsMonitor
 from cs.CsLoadBalancer import CsLoadBalancer
 from cs.CsConfig import CsConfig
 from cs.CsProcess import CsProcess
+from cs.CsStaticRoutes import CsStaticRoutes
 
 
 class CsPassword(CsDataBag):
@@ -74,6 +75,7 @@ class CsPassword(CsDataBag):
                 logging.debug("Update password server result ==> %s" % result)
 
 
+<<<<<<< HEAD
 class CsStaticRoutes(CsDataBag):
     
     def process(self):
@@ -95,6 +97,8 @@ class CsStaticRoutes(CsDataBag):
                 result = CsHelper.execute(route_command)
 
 
+=======
+>>>>>>> b9feb39... apply static routes on change to master state
 class CsAcl(CsDataBag):
     """
         Deal with Network acls
