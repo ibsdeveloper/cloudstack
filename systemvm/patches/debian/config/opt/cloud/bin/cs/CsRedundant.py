@@ -36,11 +36,11 @@ import CsHelper
 from CsFile import CsFile
 from CsProcess import CsProcess
 from CsApp import CsPasswdSvc
-from CsAddress import CsDevice
+from CsAddress import CsDevice, VPC_PUBLIC_INTERFACE, NETWORK_PUBLIC_INTERFACE
 from CsRoute import CsRoute
+from CsStaticRoutes import CsStaticRoutes
 import socket
 from time import sleep
-
 
 class CsRedundant(object):
 
@@ -88,7 +88,7 @@ class CsRedundant(object):
             self._redundant_off()
             return
 
-        interfaces = [interface for interface in self.address.get_ips() if interface.is_guest()]
+        interfaces = [interface for interface in self.address.get_interfaces() if interface.is_guest()]
         isDeviceReady = False
         dev = ''
         for interface in interfaces:
@@ -228,9 +228,9 @@ class CsRedundant(object):
         self.set_lock()
         logging.info("Router switched to fault mode")
 
-        ips = [ip for ip in self.address.get_ips() if ip.is_public()]
-        for ip in ips:
-            CsHelper.execute("ifconfig %s down" % ip.get_device())
+        interfaces = [interface for interface in self.address.get_interfaces() if interface.is_public()]
+        for interface in interfaces:
+            CsHelper.execute("ifconfig %s down" % interface.get_device())
 
         cmd = "%s -C %s" % (self.CONNTRACKD_BIN, self.CONNTRACKD_CONF)
         CsHelper.execute("%s -s" % cmd)
@@ -238,14 +238,15 @@ class CsRedundant(object):
         CsHelper.service("xl2tpd", "stop")
         CsHelper.service("dnsmasq", "stop")
 
-        ips = [ip for ip in self.address.get_ips() if ip.needs_vrrp()]
-        for ip in ips:
-            CsPasswdSvc(ip.get_gateway()).stop()
+        self._restart_password_server()
 
         self.cl.set_fault_state()
         self.cl.save()
         self.release_lock()
         logging.info("Router switched to fault mode")
+
+        interfaces = [interface for interface in self.address.get_interfaces() if interface.is_public()]
+        CsHelper.reconfigure_interfaces(self.cl, interfaces)
 
     def set_backup(self):
         """ Set the current router to backup """
@@ -257,28 +258,29 @@ class CsRedundant(object):
         logging.debug("Setting router to backup")
 
         dev = ''
-        ips = [ip for ip in self.address.get_ips() if ip.is_public()]
-        for ip in ips:
-            if dev == ip.get_device():
+        interfaces = [interface for interface in self.address.get_interfaces() if interface.is_public()]
+        for interface in interfaces:
+            if dev == interface.get_device():
                 continue
-            logging.info("Bringing public interface %s down" % ip.get_device())
-            cmd2 = "ip link set %s down" % ip.get_device()
+            logging.info("Bringing public interface %s down" % interface.get_device())
+            cmd2 = "ip link set %s down" % interface.get_device()
             CsHelper.execute(cmd2)
-            dev = ip.get_device()
+            dev = interface.get_device()
 
         cmd = "%s -C %s" % (self.CONNTRACKD_BIN, self.CONNTRACKD_CONF)
         CsHelper.execute("%s -d" % cmd)
         CsHelper.service("ipsec", "stop")
         CsHelper.service("xl2tpd", "stop")
-
-        ips = [ip for ip in self.address.get_ips() if ip.needs_vrrp()]
-        for ip in ips:
-            CsPasswdSvc(ip.get_gateway()).stop()
         CsHelper.service("dnsmasq", "stop")
+
+        self._restart_password_server()
 
         self.cl.set_master_state(False)
         self.cl.save()
         self.release_lock()
+
+        interfaces = [interface for interface in self.address.get_interfaces() if interface.is_public()]
+        CsHelper.reconfigure_interfaces(self.cl, interfaces)
         logging.info("Router switched to backup mode")
 
     def set_master(self):
@@ -290,29 +292,12 @@ class CsRedundant(object):
         self.set_lock()
         logging.debug("Setting router to master")
 
-        dev = ''
-        ips = [ip for ip in self.address.get_ips() if ip.is_public()]
-        route = CsRoute()
-        for ip in ips:
-            if dev == ip.get_device():
-                continue
-            dev = ip.get_device()
-            logging.info("Will proceed configuring device ==> %s" % dev)
-            cmd2 = "ip link set %s up" % dev
-            if CsDevice(dev, self.config).waitfordevice():
-                CsHelper.execute(cmd2)
-                logging.info("Bringing public interface %s up" % dev)
+        self._bring_public_interfaces_up()
 
-                try:
-                    gateway = ip.get_gateway()
-                    logging.info("Adding gateway ==> %s to device ==> %s" % (gateway, dev))
-                    route.add_defaultroute(gateway)
-                except:
-                    logging.error("ERROR getting gateway from device %s" % dev)
-            else:
-                logging.error("Device %s was not ready could not bring it up" % dev)
+        logging.debug("Configuring static routes")
+        static_routes = CsStaticRoutes("staticroutes", self.config)
+        static_routes.process()
 
-        # ip route add default via $gw table Table_$dev proto static
         cmd = "%s -C %s" % (self.CONNTRACKD_BIN, self.CONNTRACKD_CONF)
         CsHelper.execute("%s -c" % cmd)
         CsHelper.execute("%s -f" % cmd)
@@ -320,15 +305,109 @@ class CsRedundant(object):
         CsHelper.execute("%s -B" % cmd)
         CsHelper.service("ipsec", "restart")
         CsHelper.service("xl2tpd", "restart")
-        ads = [o for o in self.address.get_ips() if o.needs_vrrp()]
-        for o in ads:
-            CsPasswdSvc(o.get_gateway()).restart()
-
         CsHelper.service("dnsmasq", "restart")
+
+        self._restart_password_server()
+
         self.cl.set_master_state(True)
         self.cl.save()
         self.release_lock()
+
+        interfaces = [interface for interface in self.address.get_interfaces() if interface.is_public()]
+        CsHelper.reconfigure_interfaces(self.cl, interfaces)
         logging.info("Router switched to master mode")
+
+
+    def _bring_public_interfaces_up(self):
+        '''Brings up all public interfaces and adds routes to the
+        relevant routing tables.
+        '''
+
+        up = []         # devices we've already brought up
+        routes = []     # routes to be added
+
+        is_link_up = "ip link show %s | grep 'state UP'"
+        set_link_up = "ip link set %s up"
+        add_route = "ip route add %s"
+        arping = "arping -c 1 -U %s -I %s"
+
+        guestIps = [ip for ip in self.address.get_interfaces() if ip.is_guest()]
+        guestDevs = []
+        for guestIp in guestIps:
+            guestDevs.append(guestIp.get_device())
+        csroute = CsRoute()
+
+        if self.config.is_vpc():
+            default_gateway = VPC_PUBLIC_INTERFACE
+        else:
+            default_gateway = NETWORK_PUBLIC_INTERFACE
+
+        public_ips = [ip for ip in self.address.get_interfaces() if ip.is_public()]
+
+        for ip in public_ips:
+            address = ip.get_ip()
+            device = ip.get_device()
+            gateway = ip.get_gateway()
+
+            logging.debug("Configuring device %s for IP %s" % (device, address))
+
+            if device in up:
+                logging.debug("Device %s already configured. Skipping..." % device)
+                continue
+
+            if not CsDevice(device, self.config).waitfordevice():
+                logging.error("Device %s was not ready could not bring it up." % device)
+                continue
+
+            if CsHelper.execute(is_link_up % device):
+                logging.warn("Device %s was found already up. Assuming routes need configuring.")
+                up.append(device)
+            else:
+                logging.info("Bringing public interface %s up" % device)
+                CsHelper.execute(set_link_up % device)
+
+            logging.debug("Collecting routes for interface %s" % device)
+            routes.append("default via %s dev %s table Table_%s" % (gateway, device, device))
+
+            if device in default_gateway:
+                logging.debug("Determined that the gateway for %s should be in the main routing table." % device)
+                routes.insert(0, "default via %s dev %s" % (gateway, device))
+
+            up.append(device)
+
+        logging.info("Adding all collected routes.")
+        for route in routes:
+            CsHelper.execute(add_route % route)
+
+        logging.info("Sending gratuitous ARP for each Public IP...")
+        for ip in public_ips:
+            address = ip.get_ip()
+            device = ip.get_device()
+            # copy ip router for guest devs to all public devs
+            csroute.copy_routes_from_main([device], guestDevs)
+            CsHelper.execute(arping % (address, device))
+
+
+
+
+
+    def _restart_password_server(self):
+        '''
+        CLOUDSTACK-9385
+        Redundant virtual routers should have the password server running.
+        '''
+        if self.config.is_vpc():
+            vrrp_addresses = [address for address in self.address.get_interfaces() if address.needs_vrrp()]
+
+            for address in vrrp_addresses:
+                CsPasswdSvc(address.get_gateway()).restart()
+                CsPasswdSvc(address.get_ip()).restart()
+        else:
+            guest_addresses = [address for address in self.address.get_interfaces() if address.is_guest()]
+
+            for address in guest_addresses:
+                CsPasswdSvc(address.get_ip()).restart()
+
 
     def _collect_ignore_ips(self):
         """
@@ -353,23 +432,14 @@ class CsRedundant(object):
         that could function as a router and VPC router at the same time
         """
         lines = []
-        for ip in self.address.get_ips():
-            if ip.needs_vrrp():
+        for interface in self.address.get_interfaces():
+            if interface.needs_vrrp():
                 cmdline=self.config.get_cmdline_instance()
-                if not ip.is_added():
+                if not interface.is_added():
                     continue
                 if(cmdline.get_type()=='router'):
-                    str = "        %s brd %s dev %s\n" % (cmdline.get_guest_gw(), ip.get_broadcast(), ip.get_device())
+                    str = "        %s brd %s dev %s\n" % (cmdline.get_guest_gw(), interface.get_broadcast(), interface.get_device())
                 else:
-                    str = "        %s brd %s dev %s\n" % (ip.get_gateway_cidr(), ip.get_broadcast(), ip.get_device())
+                    str = "        %s brd %s dev %s\n" % (interface.get_gateway_cidr(), interface.get_broadcast(), interface.get_device())
                 lines.append(str)
         return lines
-
-    def check_is_up(self, device):
-        """ Ensure device is up """
-        cmd = "ip link show %s | grep 'state DOWN'" % device
-
-        for i in CsHelper.execute(cmd):
-            if " DOWN " in i:
-                cmd2 = "ip link set %s up" % device
-                CsHelper.execute(cmd2)

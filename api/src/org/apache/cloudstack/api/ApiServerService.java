@@ -40,4 +40,8 @@ public interface ApiServerService {
     public String handleRequest(Map params, String responseType, StringBuilder auditTrailSb) throws ServerApiException;
 
     public Class<?> getCmdClass(String cmdName);
+
+    public String getJSONContentType();
+
+    public boolean isSecureSessionCookieEnabled();
 }
